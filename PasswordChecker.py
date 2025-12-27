@@ -6,7 +6,9 @@ import hashlib
 import urllib.request
 import urllib.error
 import json
-from typing import Dict, List
+import time
+import concurrent.futures
+from typing import Dict, List, Set, Optional
 
 # Password strength criteria, min length and bad passwords list, can check breached passwords via HIBP
 MIN_LENGTH = 14
@@ -57,47 +59,148 @@ def password_feedback(password: str) -> str:
 
 
 # HIBP (Have I Been Pwned) pwned-passwords check via k-anonymity API
-def pwned_count(password: str, timeout: int = 10) -> int:
-    """Return number of times the password appears in HIBP dataset. 0 means not found.
+DEFAULT_WORKERS = 4
+BACKOFF_BASE = 1.0
+BACKOFF_FACTOR = 2.0
+MAX_RETRIES = 4
 
-    This uses the k-anonymity API: https://haveibeenpwned.com/API/v3#PwnedPasswords
+
+def _fetch_prefix_from_hibp(prefix: str, timeout: int = 10) -> str:
+    """Fetch raw HIBP range response for a 5-char prefix, with retries/backoff.
+
+    Returns the response body as text. Raises on unrecoverable errors.
     """
-    sha1 = hashlib.sha1(password.encode('utf-8')).hexdigest().upper()
-    prefix, suffix = sha1[:5], sha1[5:]
     url = f"https://api.pwnedpasswords.com/range/{prefix}"
     req = urllib.request.Request(url, headers={"User-Agent": "PasswordChecker/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode('utf-8')
-    except urllib.error.HTTPError as e:
-        raise
+    backoff = BACKOFF_BASE
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode('utf-8')
+        except urllib.error.HTTPError as e:
+            code = getattr(e, 'code', None)
+            if code == 429 or (500 <= (code or 0) < 600):
+                if attempt == MAX_RETRIES:
+                    raise
+                time.sleep(backoff)
+                backoff *= BACKOFF_FACTOR
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(backoff)
+            backoff *= BACKOFF_FACTOR
+    raise RuntimeError("Failed to fetch prefix after retries")
 
+
+def _parse_range_body(body: str) -> Dict[str, int]:
+    """Parse HIBP range body into mapping of suffix -> count."""
+    d: Dict[str, int] = {}
     for line in body.splitlines():
-        h, count = line.split(":")
-        if h == suffix:
-            return int(count)
-    return 0
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) != 2:
+            continue
+        h, count = parts
+        try:
+            d[h] = int(count)
+        except ValueError:
+            continue
+    return d
 
 
-def check_passwords_in_file(path: str, check_pwned: bool = False) -> Dict[str, Dict]:
+def _mask_password(pw: str) -> str:
+    """Return a masked representation of a password (not reversible)."""
+    if not pw:
+        return ""
+    if len(pw) <= 2:
+        return "**"
+    return pw[0] + "*" * min(6, len(pw) - 2) + pw[-1]
+
+
+def pwned_count(password: str, timeout: int = 10) -> int:
+    """Compatibility wrapper: single-password check (not optimized for large lists)."""
+    sha1 = hashlib.sha1(password.encode('utf-8')).hexdigest().upper()
+    prefix, suffix = sha1[:5], sha1[5:]
+    body = _fetch_prefix_from_hibp(prefix, timeout=timeout)
+    table = _parse_range_body(body)
+    return table.get(suffix, 0)
+
+
+def check_passwords_in_file(path: str, check_pwned: bool = False, workers: int = DEFAULT_WORKERS, progress_interval: int = 1000) -> Dict[str, Dict]:
     """Load passwords from `path` (one per line) and check each.
 
-    Returns a dict mapping password -> {"issues": [...], "pwned": count_or_-1_on_error}
+    Returns a dict mapping `sha1:<HEX>` -> {"masked": str, "issues": [...], "pwned": count_or_-1_on_error}
+    Raw passwords are never stored in the returned dict or written to disk.
     """
-    results: Dict[str, Dict] = {}
+    entries: List[Dict] = []
+    prefixes: Set[str] = set()
+    total = 0
+
+    # First pass: read file, compute sha1/prefix/suffix and local strength issues
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         for raw in f:
             pw = raw.rstrip('\n')
             if not pw:
                 continue
-            issues = password_issues(pw)
-            pwned = None
-            if check_pwned:
+            total += 1
+            sha1 = hashlib.sha1(pw.encode('utf-8')).hexdigest().upper()
+            prefix, suffix = sha1[:5], sha1[5:]
+            prefixes.add(prefix)
+            entries.append({
+                'sha1': sha1,
+                'prefix': prefix,
+                'suffix': suffix,
+                'masked': _mask_password(pw),
+                'issues': password_issues(pw),
+                'pwned': None,
+            })
+            if total % progress_interval == 0:
+                print(f"Read {total} passwords...")
+
+    if check_pwned and prefixes:
+        # Fetch prefixes in parallel with caching
+        prefix_cache: Dict[str, Optional[Dict[str, int]]] = {}
+
+        def _fetch_and_parse(pref: str) -> (str, Optional[Dict[str, int]]):
+            try:
+                body = _fetch_prefix_from_hibp(pref)
+                return pref, _parse_range_body(body)
+            except Exception:
+                return pref, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_fetch_and_parse, p): p for p in prefixes}
+            fetched = 0
+            for fut in concurrent.futures.as_completed(futures):
+                pref = futures[fut]
                 try:
-                    pwned = pwned_count(pw)
+                    p, table = fut.result()
+                    prefix_cache[p] = table
                 except Exception:
-                    pwned = -1
-            results[pw] = {"issues": issues, "pwned": pwned}
+                    prefix_cache[pref] = None
+                fetched += 1
+                if fetched % max(1, workers) == 0:
+                    print(f"Fetched {fetched}/{len(prefixes)} prefixes...")
+
+        # Populate pwned counts per entry
+        for i, e in enumerate(entries, 1):
+            table = prefix_cache.get(e['prefix'])
+            if table is None:
+                e['pwned'] = -1
+            else:
+                e['pwned'] = table.get(e['suffix'], 0)
+            if i % progress_interval == 0:
+                print(f"Processed {i}/{len(entries)} passwords...")
+
+    # Build results keyed by sha1 to avoid storing plaintext
+    results: Dict[str, Dict] = {}
+    for e in entries:
+        key = f"sha1:{e['sha1']}"
+        results[key] = {"masked": e['masked'], "issues": e['issues'], "pwned": e['pwned']}
+
     return results
 
 
@@ -130,11 +233,13 @@ def main():
     parser = argparse.ArgumentParser(description='Password strength and list checker')
     parser.add_argument('--file', '-f', help='Path to file with one password per line')
     parser.add_argument('--pwned', action='store_true', help='Check passwords against HIBP pwned-passwords')
-    parser.add_argument('--json', help='Write results JSON to given path')
+    parser.add_argument('--workers', type=int, default=DEFAULT_WORKERS, help='Number of concurrent workers for prefix fetching')
+    parser.add_argument('--progress', type=int, default=1000, help='Print progress every N passwords read/processed')
+    parser.add_argument('--json', help='Write results JSON to given path (will not contain raw passwords)')
     args = parser.parse_args()
 
     if args.file:
-        results = check_passwords_in_file(args.file, check_pwned=args.pwned)
+        results = check_passwords_in_file(args.file, check_pwned=args.pwned, workers=args.workers, progress_interval=args.progress)
         print_summary(results)
         if args.json:
             with open(args.json, 'w', encoding='utf-8') as out:
